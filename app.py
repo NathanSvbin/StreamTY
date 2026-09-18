@@ -1,274 +1,187 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-
-from rapidfuzz import process, fuzz
-from bs4 import BeautifulSoup
+from rapidfuzz import fuzz, process
 
 import requests
 import json
 import os
 import re
-import unicodedata
 
-
-app = Flask(__name__)
-CORS(app)
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+app = Flask(__name__)
 
-DATA_FILE = os.path.join(
-    BASE_DIR,
-    "data",
-    "AnimeInfo.json"
+# Autorise les requêtes provenant de ton site
+# et des autres clients web.
+CORS(
+    app,
+    resources={
+        r"/api/*": {
+            "origins": "*",
+            "methods": ["GET", "OPTIONS"],
+            "allow_headers": ["Content-Type"]
+        }
+    }
 )
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/138.0.0.0 Safari/537.36"
-    ),
-    "Accept": (
-        "text/html,application/xhtml+xml,"
-        "application/xml;q=0.9,*/*;q=0.8"
-    ),
-    "Accept-Language": (
-        "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7"
-    ),
-}
 
-# Le catalogue est chargé une seule fois
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_FILE = os.path.join(BASE_DIR, "data", "AnimeInfo.json")
+
 ANIME_DATABASE = None
 
 
 # ============================================================
-# CHARGEMENT DU CATALOGUE
+# CHARGEMENT DE LA BASE
 # ============================================================
 
 def load_database():
-
     global ANIME_DATABASE
 
     if ANIME_DATABASE is not None:
         return ANIME_DATABASE
 
-    if not os.path.exists(DATA_FILE):
-        raise FileNotFoundError(
-            f"Fichier introuvable : {DATA_FILE}"
-        )
+    try:
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
 
-    with open(
-        DATA_FILE,
-        "r",
-        encoding="utf-8"
-    ) as file:
+        if isinstance(data, list):
+            ANIME_DATABASE = data
+        else:
+            ANIME_DATABASE = []
 
-        data = json.load(file)
+        return ANIME_DATABASE
 
-    if not isinstance(data, list):
-        raise ValueError(
-            "AnimeInfo.json doit contenir une liste"
-        )
-
-    ANIME_DATABASE = data
-
-    return ANIME_DATABASE
+    except Exception as e:
+        print("Erreur chargement AnimeInfo.json :", e)
+        ANIME_DATABASE = []
+        return ANIME_DATABASE
 
 
 # ============================================================
-# NORMALISATION
+# UTILITAIRES
 # ============================================================
 
-def normalize_title(title):
-
-    if not title:
+def normalize(text):
+    if not text:
         return ""
 
-    title = unicodedata.normalize(
-        "NFKD",
-        str(title)
-    )
+    text = str(text).lower().strip()
 
-    title = "".join(
-        c for c in title
-        if not unicodedata.combining(c)
-    )
+    # Suppression des accents
+    replacements = {
+        "à": "a",
+        "â": "a",
+        "ä": "a",
+        "á": "a",
+        "ã": "a",
+        "å": "a",
+        "ç": "c",
+        "é": "e",
+        "è": "e",
+        "ê": "e",
+        "ë": "e",
+        "î": "i",
+        "ï": "i",
+        "ì": "i",
+        "í": "i",
+        "ô": "o",
+        "ö": "o",
+        "ò": "o",
+        "ó": "o",
+        "õ": "o",
+        "ù": "u",
+        "û": "u",
+        "ü": "u",
+        "ú": "u",
+        "ÿ": "y",
+        "ñ": "n"
+    }
 
-    title = title.lower()
+    for old, new in replacements.items():
+        text = text.replace(old, new)
 
-    title = re.sub(
-        r"[^a-zA-Z0-9\s]",
-        " ",
-        title
-    )
+    text = re.sub(r"[^a-z0-9\s]", " ", text)
+    text = re.sub(r"\s+", " ", text)
 
-    title = re.sub(
-        r"\s+",
-        " ",
-        title
-    )
-
-    return title.strip()
+    return text.strip()
 
 
-# ============================================================
-# RECHERCHE ANIME
-# ============================================================
-
-def search_anime(query, limit=5):
-
+def search_anime(query, limit=10):
     database = load_database()
 
-    query_clean = normalize_title(query)
-
-    if not query_clean:
+    if not query:
         return []
 
-    # --------------------------------------------------------
-    # Recherche exacte en premier
-    # --------------------------------------------------------
+    query_normalized = normalize(query)
 
-    for anime in database:
+    if not query_normalized:
+        return []
 
-        title = anime.get(
-            "title",
-            ""
-        )
+    # On crée une liste de titres normalisés.
+    # On garde ensuite l'index pour retrouver l'anime.
+    choices = []
 
-        if normalize_title(title) == query_clean:
-
-            return [{
-                "title": title,
-                "lien": anime.get(
-                    "link",
-                    ""
-                ),
-                "cover": anime.get(
-                    "cover",
-                    ""
-                ),
-                "score": 100
-            }]
-
-    # --------------------------------------------------------
-    # Recherche floue
-    # --------------------------------------------------------
-
-    titles = {}
-
-    for anime in database:
-
-        title = anime.get(
-            "title",
-            ""
-        )
-
-        if not title:
+    for index, anime in enumerate(database):
+        if not isinstance(anime, dict):
             continue
 
-        normalized = normalize_title(
-            title
-        )
+        title = anime.get("title", "")
 
-        if normalized:
-            titles[normalized] = anime
+        if title:
+            choices.append((normalize(title), index))
+
+        # Compatibilité avec une éventuelle ancienne base
+        alter_title = anime.get("AlterTitle", "")
+
+        if alter_title:
+            if isinstance(alter_title, list):
+                for alt in alter_title:
+                    choices.append((normalize(alt), index))
+            else:
+                choices.append((normalize(alter_title), index))
+
+    if not choices:
+        return []
+
+    title_list = [item[0] for item in choices]
 
     matches = process.extract(
-        query_clean,
-        list(titles.keys()),
+        query_normalized,
+        title_list,
         scorer=fuzz.token_set_ratio,
-        limit=15
+        limit=limit
     )
 
     results = []
+    already_added = set()
 
-    for normalized_title, score, _ in matches:
+    for matched_title, score, choice_index in matches:
 
-        if score < 75:
+        anime_index = choices[choice_index][1]
+
+        if anime_index in already_added:
             continue
 
-        anime = titles[
-            normalized_title
-        ]
+        already_added.add(anime_index)
 
-        title = anime.get(
-            "title",
-            ""
-        )
-
-        # Bonus si les longueurs sont proches
-        query_length = len(query_clean)
-        title_length = len(normalized_title)
-
-        if query_length > 0:
-
-            ratio = (
-                title_length /
-                query_length
-            )
-
-        else:
-            ratio = 0
-
-        bonus = 0
-
-        if 0.9 <= ratio <= 1.1:
-            bonus = 10
-
-        elif ratio < 0.5:
-            bonus = -15
-
-        final_score = score + bonus
+        anime = database[anime_index]
 
         results.append({
-            "title": title,
-            "lien": anime.get(
-                "link",
-                ""
-            ),
-            "cover": anime.get(
-                "cover",
-                ""
-            ),
-            "score": final_score
+            "title": anime.get("title", ""),
+            "link": anime.get("link", ""),
+            "cover": anime.get("cover", ""),
+            "score": round(score, 2)
         })
 
-    # Meilleur score en premier
-    results.sort(
-        key=lambda x: x["score"],
-        reverse=True
-    )
-
-    # Suppression des doublons
-    final_results = []
-    seen = set()
-
-    for result in results:
-
-        link = result["lien"]
-
-        if link in seen:
-            continue
-
-        seen.add(link)
-        final_results.append(result)
-
-        if len(final_results) >= limit:
-            break
-
-    return final_results
+    return results
 
 
-def find_anime(query):
-
-    results = search_anime(
-        query,
-        limit=5
-    )
+def find_best_anime(query):
+    results = search_anime(query, limit=5)
 
     if not results:
         return None
@@ -277,966 +190,504 @@ def find_anime(query):
 
 
 # ============================================================
-# HTTP
+# ANIME-SAMA
 # ============================================================
 
-def request_page(url, timeout=15):
+ANIME_SAMA_DOMAIN = "https://anime-sama.to"
 
-    response = requests.get(
-        url,
-        headers=HEADERS,
-        timeout=timeout
-    )
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/151.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8"
+}
 
-    response.raise_for_status()
 
-    return response.text
-
-
-# ============================================================
-# EXTRACTION DES SAISONS
-#
-# Anime-Sama utilise des appels JavaScript du genre :
-#
-# panneauAnime("Saison 1", "saison1")
-#
-# Le projet AnimeSamaApi officiel utilise cette méthode.
-# ============================================================
-
-def extract_seasons(
-    html,
-    base_url,
-    title,
-    cover
-):
-
-    results = []
-
-    # Retire les commentaires JS
-    html_clean = re.sub(
-        r"/\*.*?\*/",
-        "",
-        html,
-        flags=re.DOTALL
-    )
-
-    # --------------------------------------------------------
-    # panneauAnime
-    # panneauFilm
-    # panneauScan
-    # panneauVisual
-    # --------------------------------------------------------
-
-    pattern = re.compile(
-        r"""
-        panneau
-        (?:Anime|Film|Scan|Visual)
-        \s*\(
-        \s*(['"])(.*?)\1
-        \s*,\s*
-        (['"])(.*?)\3
-        \s*\)
-        """,
-        re.IGNORECASE |
-        re.VERBOSE
-    )
-
-    for match in pattern.finditer(
-        html_clean
-    ):
-
-        name = match.group(2).strip()
-        relative_url = match.group(4).strip()
-
-        if not name:
-            continue
-
-        if name.lower() == "nom":
-            continue
-
-        if relative_url.lower() == "url":
-            continue
-
-        full_url = (
-            base_url.rstrip("/")
-            + "/"
-            + relative_url.lstrip("/")
+def anime_sama_request(url):
+    try:
+        response = requests.get(
+            url,
+            headers=HEADERS,
+            timeout=20
         )
 
-        results.append({
-            "base_url": base_url,
-            "title": title,
-            "cover": cover,
-            "Saison": name,
-            "url": full_url
-        })
+        response.raise_for_status()
 
-    # --------------------------------------------------------
-    # Fallback si le JS utilise une autre forme
-    # --------------------------------------------------------
+        return response.text
 
-    if not results:
-
-        soup = BeautifulSoup(
-            html,
-            "html.parser"
-        )
-
-        for script in soup.find_all(
-            "script"
-        ):
-
-            script_text = (
-                script.string
-                or script.get_text()
-                or ""
-            )
-
-            if not script_text:
-                continue
-
-            matches = re.findall(
-                r"""
-                panneau
-                (?:Anime|Film|Scan|Visual)
-                \s*\(
-                \s*['"]([^'"]+)['"]
-                \s*,\s*
-                ['"]([^'"]+)['"]
-                \s*\)
-                """,
-                script_text,
-                flags=re.I |
-                re.X
-            )
-
-            for name, relative_url in matches:
-
-                if name.lower() == "nom":
-                    continue
-
-                if relative_url.lower() == "url":
-                    continue
-
-                full_url = (
-                    base_url.rstrip("/")
-                    + "/"
-                    + relative_url.lstrip("/")
-                )
-
-                results.append({
-                    "base_url": base_url,
-                    "title": title,
-                    "cover": cover,
-                    "Saison": name.strip(),
-                    "url": full_url
-                })
-
-    # Suppression des doublons
-    unique = []
-    seen = set()
-
-    for item in results:
-
-        key = item["url"]
-
-        if key in seen:
-            continue
-
-        seen.add(key)
-        unique.append(item)
-
-    return unique
+    except Exception as e:
+        print("Erreur requête AnimeSama :", e)
+        return None
 
 
 # ============================================================
-# GET /
+# ROUTE PRINCIPALE
 # ============================================================
 
 @app.route("/")
 def home():
+    database = load_database()
 
-    try:
-        database = load_database()
-
-        return jsonify({
-            "status": "online",
-            "service": "StreamTY Anime API",
-            "catalogue": len(database),
-            "endpoints": {
-                "search": "/api/getSerchAnime",
-                "info": "/api/getInfoAnime",
-                "specific": "/api/getSpecificAnime",
-                "episodes": "/api/getAnimeLink"
-            }
-        })
-
-    except Exception as e:
-
-        return jsonify({
-            "status": "error",
-            "message": str(e)
-        }), 500
+    return jsonify({
+        "status": "online",
+        "service": "AnimeSama API",
+        "catalogue_loaded": len(database),
+        "endpoints": [
+            "/api/getAllAnime",
+            "/api/loadBaseAnimeData",
+            "/api/getSerchAnime?q=My%20Hero%20Academia",
+            "/api/getInfoAnime?q=Demon%20Slayer",
+            "/api/getSpecificAnime?q=One%20Piece&s=saison1&v=vostfr",
+            "/api/getAnimeLink?n=Spy%20x%20Family&s=saison1&v=vostfr",
+            "/api/getAnimeSamaURL?n=My%20Hero%20Academia"
+        ]
+    })
 
 
 # ============================================================
 # GET ALL ANIME
 # ============================================================
 
-@app.route(
-    "/api/getAllAnime",
-    methods=["GET"]
-)
+@app.route("/api/getAllAnime", methods=["GET"])
 def get_all_anime():
 
-    try:
+    database = load_database()
 
-        return jsonify(
-            load_database()
-        )
-
-    except Exception as e:
-
-        return jsonify({
-            "error": str(e)
-        }), 500
+    return jsonify(database)
 
 
 # ============================================================
-# LOAD BASE
+# LOAD BASE ANIME DATA
 # ============================================================
 
-@app.route(
-    "/api/loadBaseAnimeData",
-    methods=["GET"]
-)
+@app.route("/api/loadBaseAnimeData", methods=["GET"])
 def load_base_anime_data():
 
-    try:
+    database = load_database()
 
-        return jsonify(
-            load_database()
-        )
-
-    except Exception as e:
-
-        return jsonify({
-            "error": str(e)
-        }), 500
+    return jsonify({
+        "success": True,
+        "count": len(database),
+        "data": database
+    })
 
 
 # ============================================================
-# SEARCH
+# RECHERCHE ANIME
 # ============================================================
 
-@app.route(
-    "/api/getSerchAnime",
-    methods=["GET"]
-)
+@app.route("/api/getSerchAnime", methods=["GET"])
 def get_search_anime():
 
-    query = request.args.get(
-        "q",
-        ""
-    ).strip()
+    query = request.args.get("q", "").strip()
 
     if not query:
-
         return jsonify({
-            "error": "Paramètre 'q' manquant"
+            "error": "Paramètre q manquant"
         }), 400
 
-    try:
+    results = search_anime(query)
 
-        limit = int(
-            request.args.get(
-                "l",
-                "5"
-            )
-        )
+    return jsonify({
+        "query": query,
+        "results": results
+    })
 
-    except ValueError:
 
-        limit = 5
+# ============================================================
+# URL ANIME-SAMA
+# ============================================================
 
-    limit = max(
-        1,
-        min(limit, 20)
-    )
+@app.route("/api/getAnimeSamaURL", methods=["GET"])
+def get_anime_sama_url():
 
-    try:
+    query = request.args.get("n", "").strip()
 
-        return jsonify(
-            search_anime(
-                query,
-                limit
-            )
-        )
+    if not query:
+        query = request.args.get("q", "").strip()
 
-    except Exception as e:
-
+    if not query:
         return jsonify({
-            "error": str(e)
-        }), 500
+            "error": "Paramètre n ou q manquant"
+        }), 400
+
+    anime = find_best_anime(query)
+
+    if not anime:
+        return jsonify({
+            "error": "Anime introuvable",
+            "query": query
+        }), 404
+
+    return jsonify({
+        "title": anime.get("title", ""),
+        "url": anime.get("link", ""),
+        "cover": anime.get("cover", "")
+    })
 
 
 # ============================================================
 # GET INFO ANIME
 # ============================================================
 
-@app.route(
-    "/api/getInfoAnime",
-    methods=["GET"]
-)
+@app.route("/api/getInfoAnime", methods=["GET"])
 def get_info_anime():
 
-    query = request.args.get(
-        "q",
-        ""
-    ).strip()
+    query = request.args.get("q", "").strip()
 
     if not query:
-
         return jsonify({
-            "error": "Paramètre 'q' manquant"
+            "error": "Paramètre q manquant"
         }), 400
 
-    try:
+    anime = find_best_anime(query)
 
-        anime = find_anime(
-            query
-        )
-
-        if not anime:
-
-            return jsonify({
-                "error": "Anime introuvable",
-                "query": query
-            }), 404
-
-        base_url = anime[
-            "lien"
-        ]
-
-        title = anime[
-            "title"
-        ]
-
-        cover = anime.get(
-            "cover",
-            ""
-        )
-
-        # ----------------------------------------------------
-        # On ne cherche sur Anime-Sama
-        # que maintenant que l'anime est trouvé
-        # dans le JSON local.
-        # ----------------------------------------------------
-
-        html = request_page(
-            base_url,
-            timeout=15
-        )
-
-        seasons = extract_seasons(
-            html,
-            base_url,
-            title,
-            cover
-        )
-
-        return jsonify(
-            seasons
-        )
-
-    except requests.RequestException as e:
-
+    if not anime:
         return jsonify({
-            "error": "Impossible de contacter Anime-Sama",
-            "message": str(e)
+            "error": "Anime introuvable",
+            "query": query
+        }), 404
+
+    anime_url = anime.get("link", "")
+
+    if not anime_url:
+        return jsonify({
+            "error": "URL AnimeSama introuvable",
+            "anime": anime
+        }), 404
+
+    html = anime_sama_request(anime_url)
+
+    if html is None:
+        return jsonify({
+            "error": "Impossible de contacter AnimeSama",
+            "title": anime.get("title", ""),
+            "url": anime_url
         }), 502
 
-    except Exception as e:
+    result = {
+        "title": anime.get("title", ""),
+        "url": anime_url,
+        "cover": anime.get("cover", ""),
+        "seasons": []
+    }
 
-        return jsonify({
-            "error": "Erreur",
-            "message": str(e)
-        }), 500
+    # --------------------------------------------------------
+    # Recherche des informations panneauAnime(...)
+    # --------------------------------------------------------
+
+    panneau_matches = re.findall(
+        r'panneauAnime\s*\((.*?)\)',
+        html,
+        re.DOTALL
+    )
+
+    seasons = []
+
+    for match in panneau_matches:
+
+        parts = [
+            x.strip().strip("'\"")
+            for x in match.split(",")
+        ]
+
+        if not parts:
+            continue
+
+        for part in parts:
+
+            part_lower = part.lower()
+
+            if "saison" in part_lower:
+
+                if part not in seasons:
+                    seasons.append(part)
+
+    # --------------------------------------------------------
+    # Recherche directe des dossiers saisonX
+    # --------------------------------------------------------
+
+    season_matches = re.findall(
+        r'saison\d+',
+        html,
+        re.IGNORECASE
+    )
+
+    for season in season_matches:
+
+        season = season.lower()
+
+        if season not in seasons:
+            seasons.append(season)
+
+    # Tri naturel
+    def season_number(value):
+        match = re.search(r"(\d+)", value)
+
+        if match:
+            return int(match.group(1))
+
+        return 9999
+
+    seasons = sorted(
+        seasons,
+        key=season_number
+    )
+
+    result["seasons"] = seasons
+
+    return jsonify(result)
 
 
 # ============================================================
 # GET SPECIFIC ANIME
 # ============================================================
 
-@app.route(
-    "/api/getSpecificAnime",
-    methods=["GET"]
-)
+@app.route("/api/getSpecificAnime", methods=["GET"])
 def get_specific_anime():
 
-    query = request.args.get(
-        "q",
-        ""
-    ).strip()
-
-    season = request.args.get(
-        "s",
-        "saison1"
-    ).strip()
-
-    version = request.args.get(
-        "v",
-        "vostfr"
-    ).strip()
+    query = request.args.get("q", "").strip()
+    season = request.args.get("s", "saison1").strip()
+    version = request.args.get("v", "vostfr").strip()
 
     if not query:
-
         return jsonify({
-            "error": "Paramètre 'q' manquant"
+            "error": "Paramètre q manquant"
         }), 400
 
-    try:
-
-        info = get_info_anime_internal(
-            query
-        )
-
-        if not info:
-
-            return jsonify({
-                "error": "Anime introuvable",
-                "query": query
-            }), 404
-
-        # ----------------------------------------------------
-        # Normalisation
-        # ----------------------------------------------------
-
-        wanted = season.lower().replace(
-            " ",
-            ""
-        )
-
-        # ----------------------------------------------------
-        # Cherche la saison demandée
-        # ----------------------------------------------------
-
-        selected = None
-
-        for item in info:
-
-            current = (
-                item.get(
-                    "Saison",
-                    ""
-                )
-                .lower()
-                .replace(" ", "")
-            )
-
-            if current == wanted:
-
-                selected = item
-                break
-
-            # OAV
-            if (
-                wanted in ["oav", "oavs"]
-                and "oav" in current
-            ):
-
-                selected = item
-                break
-
-            # Film
-            if (
-                wanted == "film"
-                and "film" in current
-            ):
-
-                selected = item
-                break
-
-        # Si non trouvé : première saison
-        if selected is None and info:
-            selected = info[0]
-
-        if selected is None:
-
-            return jsonify({
-                "error": "Saison introuvable",
-                "anime": query,
-                "saison": season
-            }), 404
-
-        url = selected[
-            "url"
-        ]
-
-        # ----------------------------------------------------
-        # Ajout de la version
-        # ----------------------------------------------------
-
-        url = url.rstrip("/")
-
-        if not re.search(
-            r"/(?:vostfr|vf)$",
-            url,
-            flags=re.I
-        ):
-
-            url = (
-                url
-                + "/"
-                + version
-            )
-
-        else:
-
-            url = re.sub(
-                r"/(?:vostfr|vf)$",
-                "/" + version,
-                url,
-                flags=re.I
-            )
-
-        result = dict(
-            selected
-        )
-
-        result["version"] = version
-        result["url"] = url
-
-        return jsonify(
-            result
-        )
-
-    except requests.RequestException as e:
-
-        return jsonify({
-            "error": "Impossible de contacter Anime-Sama",
-            "message": str(e)
-        }), 502
-
-    except Exception as e:
-
-        return jsonify({
-            "error": "Erreur",
-            "message": str(e)
-        }), 500
-
-
-def get_info_anime_internal(query):
-
-    anime = find_anime(
-        query
-    )
+    anime = find_best_anime(query)
 
     if not anime:
-        return []
+        return jsonify({
+            "error": "Anime introuvable",
+            "query": query
+        }), 404
 
-    base_url = anime[
-        "lien"
-    ]
+    base_url = anime.get("link", "")
 
-    title = anime[
-        "title"
-    ]
+    if not base_url:
+        return jsonify({
+            "error": "URL AnimeSama introuvable"
+        }), 404
 
-    cover = anime.get(
-        "cover",
-        ""
+    base_url = base_url.rstrip("/")
+
+    # Si l'URL catalogue contient déjà quelque chose,
+    # on récupère uniquement la partie catalogue.
+    match = re.search(
+        r"(https://anime-sama\.to/catalogue/[^/]+)",
+        base_url
     )
 
-    html = request_page(
-        base_url,
-        timeout=15
+    if match:
+        catalogue_url = match.group(1)
+    else:
+        catalogue_url = base_url
+
+    final_url = (
+        f"{catalogue_url}/"
+        f"{season}/"
+        f"{version}"
     )
 
-    return extract_seasons(
-        html,
-        base_url,
-        title,
-        cover
-    )
+    html = anime_sama_request(final_url)
+
+    if html is None:
+        return jsonify({
+            "error": "Impossible de contacter AnimeSama",
+            "url": final_url
+        }), 502
+
+    return jsonify({
+        "title": anime.get("title", ""),
+        "season": season,
+        "version": version,
+        "url": final_url,
+        "cover": anime.get("cover", "")
+    })
 
 
 # ============================================================
-# EPISODES
-#
-# Anime-Sama utilise episodes.js.
-# On récupère le script puis les variables eps1,
-# eps2, epsAS, etc.
+# GET EPISODES / LIENS
 # ============================================================
 
-@app.route(
-    "/api/getAnimeLink",
-    methods=["GET"]
-)
+@app.route("/api/getAnimeLink", methods=["GET"])
 def get_anime_link():
 
-    name = request.args.get(
-        "n",
-        ""
-    ).strip()
+    query = request.args.get("n", "").strip()
+    season = request.args.get("s", "saison1").strip()
+    version = request.args.get("v", "vostfr").strip()
 
-    season = request.args.get(
-        "s",
-        "saison1"
-    ).strip()
-
-    version = request.args.get(
-        "v",
-        "vostfr"
-    ).strip()
-
-    if not name:
-
+    if not query:
         return jsonify({
-            "error": "Paramètre 'n' manquant"
+            "error": "Paramètre n manquant"
         }), 400
 
-    try:
+    anime = find_best_anime(query)
 
-        specific = get_specific_anime_internal(
-            name,
-            season,
-            version
-        )
+    if not anime:
+        return jsonify({
+            "error": "Anime introuvable",
+            "query": query
+        }), 404
 
-        if not specific:
+    base_url = anime.get("link", "")
 
-            return jsonify({
-                "error": "Saison introuvable",
-                "anime": name,
-                "saison": season
-            }), 404
+    if not base_url:
+        return jsonify({
+            "error": "URL AnimeSama introuvable"
+        }), 404
 
-        url = specific[
-            "url"
-        ]
+    base_url = base_url.rstrip("/")
 
-        # ----------------------------------------------------
-        # Récupération de la page de la saison
-        # ----------------------------------------------------
+    match = re.search(
+        r"(https://anime-sama\.to/catalogue/[^/]+)",
+        base_url
+    )
 
-        html = request_page(
-            url,
-            timeout=20
-        )
+    if match:
+        catalogue_url = match.group(1)
+    else:
+        catalogue_url = base_url
 
-        soup = BeautifulSoup(
-            html,
-            "html.parser"
-        )
+    final_url = (
+        f"{catalogue_url}/"
+        f"{season}/"
+        f"{version}"
+    )
 
-        # ----------------------------------------------------
-        # Recherche episodes.js
-        # ----------------------------------------------------
+    html = anime_sama_request(final_url)
 
-        script_tag = soup.find(
-            "script",
-            src=lambda src: (
-                src
-                and "episodes.js" in src
-            )
-        )
+    if html is None:
+        return jsonify({
+            "error": "Impossible de contacter AnimeSama",
+            "url": final_url
+        }), 502
 
-        if not script_tag:
+    episodes = []
 
-            return jsonify({
-                "error": "episodes.js introuvable",
-                "title": name,
-                "season": season,
-                "version": version,
-                "url": url,
-                "episodes": []
-            }), 502
+    # --------------------------------------------------------
+    # Recherche du fichier episodes.js
+    # --------------------------------------------------------
 
-        script_src = script_tag.get(
-            "src",
-            ""
-        )
+    episode_scripts = re.findall(
+        r'<script[^>]+src=["\']([^"\']*episodes\.js[^"\']*)["\']',
+        html,
+        re.IGNORECASE
+    )
 
-        js_url = (
-            url.rstrip("/")
-            + "/"
-            + script_src.lstrip("/")
-        )
+    # --------------------------------------------------------
+    # Si episodes.js est trouvé
+    # --------------------------------------------------------
 
-        js_response = requests.get(
-            js_url,
-            headers=HEADERS,
-            timeout=20
-        )
+    for script_url in episode_scripts:
 
-        js_response.raise_for_status()
+        if script_url.startswith("//"):
+            script_url = "https:" + script_url
 
-        js_text = js_response.text
+        elif script_url.startswith("/"):
+            script_url = ANIME_SAMA_DOMAIN + script_url
+
+        elif not script_url.startswith("http"):
+            script_url = final_url.rstrip("/") + "/" + script_url
+
+        script_content = anime_sama_request(script_url)
+
+        if not script_content:
+            continue
 
         # ----------------------------------------------------
         # Recherche :
         #
-        # var eps1 = ['...', '...'];
-        # var eps2 = ['...', '...'];
-        # var epsAS = ['...', '...'];
+        # var eps1 = [...]
+        # let eps1 = [...]
+        # const eps1 = [...]
         # ----------------------------------------------------
 
-        matches = re.findall(
-            r"""
-            var\s+
-            (eps\w+)
-            \s*=\s*
-            \[
-            (.*?)
-            \]
-            ;
-            """,
-            js_text,
-            flags=re.DOTALL |
-            re.IGNORECASE |
-            re.VERBOSE
+        pattern = re.compile(
+            rf"(?:var|let|const)\s+eps(\d+)\s*=\s*(\[[\s\S]*?\])",
+            re.IGNORECASE
         )
 
-        all_players = {}
+        matches = pattern.findall(script_content)
 
-        for player_name, content in matches:
+        for player_number, array_content in matches:
 
+            # Recherche des URLs dans le tableau
             urls = re.findall(
-                r"""
-                ['"]
-                (https?://[^'"]+)
-                ['"]
-                """,
-                content,
-                flags=re.I |
-                re.X
+                r'https?://[^"\']+',
+                array_content
             )
 
-            if urls:
+            for episode_index, url in enumerate(urls):
 
-                all_players[
-                    player_name
-                ] = urls
-
-        # ----------------------------------------------------
-        # Aucun épisode
-        # ----------------------------------------------------
-
-        if not all_players:
-
-            return jsonify({
-                "title": name,
-                "season": season,
-                "version": version,
-                "url": url,
-                "episodes": []
-            })
-
-        # ----------------------------------------------------
-        # Choisir le meilleur lecteur
-        #
-        # On ne résout pas les lecteurs ici.
-        # On retourne les URLs trouvées par Anime-Sama.
-        # ----------------------------------------------------
-
-        player_order = []
-
-        def player_number(player):
-
-            number = re.sub(
-                r"[^0-9]",
-                "",
-                player
-            )
-
-            if number:
-                return int(number)
-
-            return 999
-
-        player_order = sorted(
-            all_players.keys(),
-            key=player_number
-        )
-
-        max_episodes = max(
-            len(urls)
-            for urls in all_players.values()
-        )
-
-        episodes = []
-
-        for episode_index in range(
-            max_episodes
-        ):
-
-            selected_url = None
-            selected_player = None
-
-            # ------------------------------------------------
-            # Priorité aux lecteurs dans l'ordre
-            # ------------------------------------------------
-
-            for player in player_order:
-
-                urls = all_players[
-                    player
-                ]
-
-                if (
-                    episode_index
-                    >= len(urls)
+                # Évite les doublons
+                if any(
+                    ep["url"] == url
+                    for ep in episodes
                 ):
                     continue
 
-                candidate = urls[
-                    episode_index
-                ].strip()
+                episodes.append({
+                    "episode": episode_index,
+                    "player": f"eps{player_number}",
+                    "url": url
+                })
 
-                if not candidate:
+    # --------------------------------------------------------
+    # Méthode alternative :
+    # recherche directe de eps1, eps2, etc.
+    # --------------------------------------------------------
+
+    if not episodes:
+
+        pattern = re.compile(
+            r'eps(\d+)\s*=\s*(\[[\s\S]*?\])',
+            re.IGNORECASE
+        )
+
+        matches = pattern.findall(html)
+
+        for player_number, array_content in matches:
+
+            urls = re.findall(
+                r'https?://[^"\']+',
+                array_content
+            )
+
+            for episode_index, url in enumerate(urls):
+
+                if any(
+                    ep["url"] == url
+                    for ep in episodes
+                ):
                     continue
-
-                selected_url = candidate
-                selected_player = player
-
-                break
-
-            if selected_url:
 
                 episodes.append({
                     "episode": episode_index,
-                    "url": selected_url,
-                    "player": selected_player
+                    "player": f"eps{player_number}",
+                    "url": url
                 })
 
-        return jsonify({
-            "title": name,
-            "season": season,
-            "version": version,
-            "url": url,
-            "episodes": episodes
-        })
+    # --------------------------------------------------------
+    # Tri des épisodes
+    # --------------------------------------------------------
 
-    except requests.RequestException as e:
-
-        return jsonify({
-            "error": "Erreur de connexion à Anime-Sama",
-            "message": str(e)
-        }), 502
-
-    except Exception as e:
-
-        return jsonify({
-            "error": "Erreur",
-            "message": str(e)
-        }), 500
-
-
-def get_specific_anime_internal(
-    name,
-    season,
-    version
-):
-
-    info = get_info_anime_internal(
-        name
-    )
-
-    if not info:
-        return None
-
-    wanted = (
-        season
-        .lower()
-        .replace(" ", "")
-    )
-
-    selected = None
-
-    for item in info:
-
-        current = (
-            item.get(
-                "Saison",
-                ""
-            )
-            .lower()
-            .replace(" ", "")
+    episodes.sort(
+        key=lambda x: (
+            x["player"],
+            x["episode"]
         )
-
-        if current == wanted:
-
-            selected = item
-            break
-
-        if (
-            wanted in ["oav", "oavs"]
-            and "oav" in current
-        ):
-
-            selected = item
-            break
-
-        if (
-            wanted == "film"
-            and "film" in current
-        ):
-
-            selected = item
-            break
-
-    if selected is None:
-
-        selected = info[0]
-
-    result = dict(
-        selected
     )
-
-    url = selected[
-        "url"
-    ].rstrip("/")
-
-    # Anime-Sama :
-    # saison1/vostfr
-    # saison1/vf
-
-    if not re.search(
-        r"/(?:vostfr|vf)$",
-        url,
-        flags=re.I
-    ):
-
-        url += "/" + version
-
-    else:
-
-        url = re.sub(
-            r"/(?:vostfr|vf)$",
-            "/" + version,
-            url,
-            flags=re.I
-        )
-
-    result["version"] = version
-    result["url"] = url
-
-    return result
-
-
-# ============================================================
-# GET ANIME SAMA URL
-# ============================================================
-
-@app.route(
-    "/api/getAnimeSamaURL",
-    methods=["GET"]
-)
-def get_anime_sama_url():
 
     return jsonify({
-        "url": "https://anime-sama.to"
+        "title": anime.get("title", ""),
+        "season": season,
+        "version": version,
+        "url": final_url,
+        "episodes": episodes
     })
 
 
@@ -1245,9 +696,8 @@ def get_anime_sama_url():
 # ============================================================
 
 if __name__ == "__main__":
-
     app.run(
         host="0.0.0.0",
         port=5000,
-        debug=True
+        debug=False
     )
